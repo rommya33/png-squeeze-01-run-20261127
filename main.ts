@@ -1,20 +1,30 @@
-// png-squeeze-01 v1 — a lossless PNG rewriter, by rommya33.
+// png-squeeze-01 v2 — a lossless PNG rewriter, by rommya33.
 //
 // It reads each stored RGBA screenshot from the input directory and rewrites it
 // in the smallest exact form it can take: a palette when the image holds at most
 // 256 colours, grey or grey-and-alpha when every pixel is grey, RGB or RGBA
 // otherwise, with a tRNS key standing in for an alpha channel when exactly one
-// fully transparent value exists and no opaque pixel uses it. Filters are picked
-// per row by the PNG minimum-sum heuristic, and the whole image is also tried
-// with each single fixed filter; every candidate is weighed by zlib at level 6
-// (plus its PLTE and tRNS chunks) and the winner is written at level 9.
+// fully transparent value exists and no opaque pixel uses it.
+//
+// v2 adds three things over v1, each weighed by real zlib size:
+//   - the fewest-distinct-pairs filter choice per row, beside the minimum-sum
+//     one and the five fixed filters (it wins the grey instance v1 lost to the
+//     scale on);
+//   - brute-force filter choice per row, each filter weighed by zlib at level 4
+//     after the 32 KiB of filtered data written before the row, run on the two
+//     forms the cheap screen liked best;
+//   - the final stream tried at zlib level 9, at level 9 with the filtered-data
+//     strategy, and at level 9 with the deepest memory, keeping the smallest.
+//
+// Every candidate is first weighed at level 6 with its PLTE and tRNS chunks;
+// the best few are re-weighed at level 9 before one is written.
 //
 // Node 22, standard library only. No network, no clock, no randomness: two runs
 // are byte-identical.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { constants, deflateSync, inflateSync } from 'node:zlib';
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -133,10 +143,33 @@ function signedSum(row) {
   return s;
 }
 
+// The fewest-distinct-pairs heuristic's cost: how many distinct pairs of
+// neighbouring bytes a filtered row holds. `seen` is a stamp table shared by
+// the rows of one image, `stamp` a fresh mark per row counted.
+function pairsOf(row, seen, stamp) {
+  let n = 0;
+  for (let i = 1; i < row.length; i++) {
+    const pair = (row[i - 1] << 8) | row[i];
+    if (seen[pair] !== stamp) {
+      seen[pair] = stamp;
+      n++;
+    }
+  }
+  return n;
+}
+
+// How many bytes written before a row brute force weighs its trials after.
+const BRUTE_CONTEXT = 32768;
+// The zlib level brute force weighs a row's trials at.
+const BRUTE_LEVEL = 4;
+
 // The raw data of `samples` (height rows of width x bpp samples), each row behind
-// its filter byte, written into `out` when given (a fresh buffer otherwise).
-// `choice` is one fixed filter type (0 to 4) for every row, or 'minsum': each row
-// the type whose filtered bytes have the least signed sum, the lower type on a tie.
+// its filter byte, written into `out` (a fresh buffer when not given).
+// `choice` is one fixed filter type (0 to 4) for every row, or 'minsum' (each row
+// the type whose filtered bytes have the least signed sum), 'pairs' (each row the
+// type with the fewest distinct byte pairs), or 'brute' (each row the type whose
+// zlib stream at level 4, after the 32 KiB written before it, is smallest);
+// the lower type on a tie.
 function filterImage(samples, width, height, bpp, choice, out = null) {
   const stride = width * bpp;
   const raw = out ?? new Uint8Array(height * (stride + 1));
@@ -149,22 +182,40 @@ function filterImage(samples, width, height, bpp, choice, out = null) {
     }
     return raw;
   }
-  const trial = [0, 1, 2, 3, 4].map(() => new Uint8Array(stride));
+  const trial = [0, 1, 2, 3, 4].map(() => new Uint8Array(stride + 1));
+  for (let t = 0; t < 5; t++) trial[t][0] = t;
+  const seen = new Uint32Array(65536);
+  let stamp = 0;
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * (stride + 1);
     let type = 0;
     let best = Infinity;
-    for (let t = 0; t < 5; t++) {
-      filterRow(t, cur, prev, bpp, trial[t]);
-      const s = signedSum(trial[t]);
-      if (s < best) {
-        best = s;
-        type = t;
+    if (choice === 'brute') {
+      const before = raw.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
+      const opts = before.length === 0
+        ? { level: BRUTE_LEVEL, memLevel: 9 }
+        : { level: BRUTE_LEVEL, memLevel: 9, dictionary: before };
+      for (let t = 0; t < 5; t++) {
+        filterRow(t, cur, prev, bpp, trial[t].subarray(1));
+        const cost = deflateSync(trial[t], opts).length;
+        if (cost < best) {
+          best = cost;
+          type = t;
+        }
+      }
+    } else {
+      for (let t = 0; t < 5; t++) {
+        filterRow(t, cur, prev, bpp, trial[t].subarray(1));
+        const cost = choice === 'minsum' ? signedSum(trial[t].subarray(1)) : pairsOf(trial[t].subarray(1), seen, ++stamp);
+        if (cost < best) {
+          best = cost;
+          type = t;
+        }
       }
     }
-    raw[y * (stride + 1)] = type;
-    raw.set(trial[type], y * (stride + 1) + 1);
+    raw.set(trial[type], at);
   }
   return raw;
 }
@@ -463,30 +514,68 @@ const SCREEN = Object.freeze({ level: 6, memLevel: 8 });
 const chunkBytes = (form) =>
   (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
 
-// The smallest exact PNG of an image: every form, each with per-row minimum-sum
-// filtering and each single fixed filter, weighed at SCREEN with its PLTE and
-// tRNS chunks; the winner written at zlib level 9.
+// The zlib settings the final stream is tried at, in order: plain level 9,
+// level 9 with the filtered-data strategy, level 9 with the deepest memory.
+const FINAL_SETTINGS = Object.freeze([
+  { level: 9 },
+  { level: 9, strategy: constants.Z_FILTERED },
+  { level: 9, memLevel: 9 },
+  { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
+]);
+
+// The smallest exact PNG of an image.
+//
+// Phase A screens every form with the five fixed filters, the minimum-sum and
+// the fewest-pairs choices per row, at SCREEN with its PLTE and tRNS chunks.
+// Phase B runs brute force on the two forms Phase A liked best and screens it
+// the same way. Phase C re-weighs the best three candidates at level 9 (with
+// the filtered-data strategy and the deepest memory on the best) and writes
+// the smallest stream.
 function squeeze(rgba, width, height) {
-  let best = null;
-  let bestData = null;
-  for (const form of formsOf(rgba)) {
+  const forms = formsOf(rgba);
+  const candidates = [];
+  const scratchFor = (form) => new Uint8Array(height * (width * form.bpp + 1));
+  for (const form of forms) {
     const overhead = chunkBytes(form);
-    // One scratch buffer per form, rewritten by every candidate; only the
-    // winner's data is copied out, so the big RGBA images are not reallocated
-    // six times over.
-    const scratch = new Uint8Array(height * (width * form.bpp + 1));
-    for (const choice of ['minsum', 0, 1, 2, 3, 4]) {
+    const scratch = scratchFor(form);
+    let formBest = Infinity;
+    for (const choice of [0, 1, 2, 3, 4, 'minsum', 'pairs']) {
       filterImage(form.samples, width, height, form.bpp, choice, scratch);
-      const zlib = deflateSync(scratch, SCREEN);
-      const bytes = zlib.length + overhead;
-      if (best === null || bytes < best.bytes) {
-        best = { form, bytes };
-        bestData = scratch.slice();
-      }
+      const bytes = deflateSync(scratch, SCREEN).length + overhead;
+      if (bytes < formBest) formBest = bytes;
+      candidates.push({ form, choice, bytes, data: scratch.slice() });
+    }
+    form._screenBest = formBest;
+  }
+  // Brute force on the two forms the cheap screen liked best.
+  const ranked = [...forms].sort((a, b) => a._screenBest - b._screenBest).slice(0, 2);
+  for (const form of ranked) {
+    const overhead = chunkBytes(form);
+    const data = filterImage(form.samples, width, height, form.bpp, 'brute');
+    const bytes = deflateSync(data, SCREEN).length + overhead;
+    candidates.push({ form, choice: 'brute', bytes, data });
+  }
+  // The best three by screen, the first on a tie, re-weighed at level 9: the
+  // best gets every setting, the runner-up level 9 and the filtered-data
+  // strategy (it won a rich image outright), the third level 9 alone.
+  candidates.sort((a, b) => a.bytes - b.bytes);
+  const finalists = candidates.slice(0, 3);
+  let best = null;
+  for (let i = 0; i < finalists.length; i++) {
+    const cand = finalists[i];
+    const overhead = chunkBytes(cand.form);
+    const settings = i === 0
+      ? FINAL_SETTINGS
+      : i === 1
+        ? [{ level: 9 }, { level: 9, strategy: constants.Z_FILTERED }]
+        : [{ level: 9 }];
+    for (const opts of settings) {
+      const idat = deflateSync(cand.data, opts);
+      const bytes = idat.length + overhead;
+      if (best === null || bytes < best.bytes) best = { form: cand.form, bytes, idat };
     }
   }
-  const idat = deflateSync(bestData, { level: 9 });
-  return pngOfForm(width, height, best.form, idat);
+  return pngOfForm(width, height, best.form, best.idat);
 }
 
 /* ------------------------------------------------------------------ */
