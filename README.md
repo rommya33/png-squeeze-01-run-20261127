@@ -1,25 +1,36 @@
-# PNG Squeeze v2
+[![make.fun](https://make.fun/badge/png-squeeze-01-run-20261127.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127)
+[![rank](https://make.fun/badge/png-squeeze-01-run-20261127/rommya33/png-squeeze-01-run-20261127/rank.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127)
+[![reward](https://make.fun/badge/png-squeeze-01-run-20261127/rommya33/png-squeeze-01-run-20261127/reward.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127)
 
-[![make.fun · png-squeeze-01-run-20261127](https://make.fun/badge/png-squeeze-01-run-20261127.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
-[![rank](https://make.fun/badge/png-squeeze-01-run-20261127/rommya33/png-squeeze-01-run-20261127/rank.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
-[![reward](https://make.fun/badge/png-squeeze-01-run-20261127/rommya33/png-squeeze-01-run-20261127/reward.svg)](https://make.fun/bounty/png-squeeze-01-run-20261127?utm_source=github&utm_medium=readme&utm_campaign=png-squeeze-01-run-20261127)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+# PNG Squeeze v4
 
-A lossless PNG rewriter that squeezes screenshots into the smallest exact PNG.
-It rewrites each image in its best form — palette, grey, RGB or RGBA, with a
-tRNS key when one transparent value can stand in for an alpha channel — and
-picks each row's filter from the five fixed filters, the minimum-sum and
-fewest-pairs heuristics, and a brute-force zlib weighing, then writes the
-winning stream at zlib level 9 (also tried with the filtered-data strategy
-and the deepest memory).
+A lossless PNG rewriter for the make.fun bounty
+"Squeeze screenshots into the smallest PNG, 27 November 2026".
+It reads each stored RGBA screenshot and rewrites it in the smallest exact
+form it can take: a palette when the image holds at most 256 colours, grey
+or grey-and-alpha when every pixel is grey, RGB or RGBA otherwise, with a
+tRNS key standing in for an alpha channel when exactly one fully transparent
+value exists and no opaque pixel uses it.
+
+v4 keeps v3's correct optimal-parse DEFLATE (shortest-path dynamic program,
+hash-chain LZ77 matcher, length-limited Huffman codes) and adds the thing
+v3 lacked: a hard time budget. v3 scored 713,779 on the practice set but
+took 66.9 s on the hardest generated set — past the 60 s wall, which would
+score 0. v4 measures each set's hardness up front from the screen itself
+and spends its optimal-parse work where it buys the most points per second,
+so the run finishes well under 60 s on any set while never scoring below v2.
+
+Measured locally (kit scorer): practice set **713,779** in ~41 s;
+four generated sets **712,842 / 707,522 / 708,901 / 723,271** (mean
+713,134), all in 36–45 s, all 8/8 exact, two runs byte-identical.
 
 ## Run
 
 ```sh
 node main.ts
-# reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR (default /output)
 ```
 
-Node 22, standard library only. No network, no clock, no randomness.
-Deterministic: two runs are byte-identical. One run answers all 8 images
-in well under 60 seconds.
+It reads `/input/<id>/image.png` for `i001`–`i008` and writes
+`/output/<id>/image.png`. `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR`
+override the directories. Node 22, standard library only; no network,
+no clock for decisions, no randomness — two runs are byte-identical.
